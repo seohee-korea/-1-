@@ -1,0 +1,223 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>1호선 도착 알람 (50m)</title>
+  <style>
+    body { font-family: system-ui, -apple-system, sans-serif; margin: 18px; }
+    .row { margin: 12px 0; }
+    select, button { font-size: 16px; padding: 10px 12px; }
+    #status { white-space: pre-line; padding: 12px; background: #f6f6f6; border-radius: 10px; }
+    small { color: #555; }
+  </style>
+</head>
+<body>
+  <h2>1호선 도착 알람 (50m)</h2>
+
+  <div class="row">
+    <label for="stationSelect">목적지(1호선 전구간): </label>
+    <select id="stationSelect" disabled>
+      <option>역 목록 불러오는 중…</option>
+    </select>
+    <div><small id="loadInfo"></small></div>
+  </div>
+
+  <div class="row">
+    <button id="startBtn" disabled>시작</button>
+    <button id="stopBtn" disabled>중지</button>
+    <button id="muteBtn" disabled>알람 끄기(소리만)</button>
+  </div>
+
+  <div id="status">대기 중…</div>
+
+  <!-- 알람 음원(원하시면 다른 ogg/mp3로 바꾸셔도 됩니다) -->
+  <audio id="alarmAudio" preload="auto" loop
+    src="https://actions.google.com/sounds/v1/alarms/alarm_clock.ogg"></audio>
+
+<script>
+  // ✅ 역/좌표 데이터(수도권 지하철 정리본)에서 1호선만 필터링
+  // 출처 소개 글(데이터 설명)과 raw JSON 링크:
+  // https://minisp.tistory.com/20
+  // https://raw.githubusercontent.com/sudo-happy/data-archive/main/metro/station/data-metro-station-1.0.0.json
+  const STATION_DATA_URL =
+    "https://raw.githubusercontent.com/sudo-happy/data-archive/main/metro/station/data-metro-station-1.0.0.json";
+
+  const RANGE_M = 50;
+
+  const $select = document.getElementById("stationSelect");
+  const $start = document.getElementById("startBtn");
+  const $stop  = document.getElementById("stopBtn");
+  const $mute  = document.getElementById("muteBtn");
+  const $status = document.getElementById("status");
+  const $alarm = document.getElementById("alarmAudio");
+  const $loadInfo = document.getElementById("loadInfo");
+
+  let watchId = null;
+  let triggered = false;
+  let wakeLock = null;
+
+  function haversineMeters(lat1, lon1, lat2, lon2) {
+    const R = 6371000;
+    const toRad = (d) => d * Math.PI / 180;
+    const dLat = toRad(lat2 - lat1);
+    const dLon = toRad(lon2 - lon1);
+    const a =
+      Math.sin(dLat/2) ** 2 +
+      Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon/2) ** 2;
+    return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  }
+
+  async function requestWakeLock() {
+    try {
+      if ("wakeLock" in navigator) {
+        wakeLock = await navigator.wakeLock.request("screen");
+      }
+    } catch (_) {}
+  }
+
+  function releaseWakeLock() {
+    if (wakeLock) {
+      try { wakeLock.release(); } catch (_) {}
+      wakeLock = null;
+    }
+  }
+
+  async function loadStations() {
+    try {
+      const res = await fetch(STATION_DATA_URL, { cache: "no-store" });
+      if (!res.ok) throw new Error("데이터 다운로드 실패");
+      const all = await res.json();
+
+      // 데이터 필드 예: { line:"1호선", name:"신도림", lat:..., lng:... }
+      const line1 = all
+        .filter(s => (s.line === "1호선") && Number.isFinite(s.lat) && Number.isFinite(s.lng));
+
+      // 보기 좋게 가나다 정렬 (원하시면 '역순서' 정렬도 따로 맞춰드릴 수 있어요)
+      const collator = new Intl.Collator("ko");
+      line1.sort((a,b) => collator.compare(a.name, b.name));
+
+      $select.innerHTML = "";
+      for (const s of line1) {
+        const opt = document.createElement("option");
+        // 혹시 동명역이 생겨도 구분 가능하게 코드도 같이 보관
+        opt.value = JSON.stringify({ name: s.name, lat: s.lat, lon: s.lng, code: s.fr_code ?? s.station_cd ?? "" });
+        opt.textContent = s.code ? `${s.name} (${s.code})` : s.name;
+        $select.appendChild(opt);
+      }
+
+      $select.disabled = false;
+      $start.disabled = false;
+      $loadInfo.textContent = `1호선 역 ${line1.length}개 로드 완료 (전구간)`;
+      $status.textContent = "목적지를 선택하고 시작을 눌러주세요.";
+
+    } catch (e) {
+      $status.textContent =
+        "역 목록을 불러오지 못했습니다.\n" +
+        "1) 인터넷 연결 확인\n2) GitHub Pages/Netlify 같은 HTTPS 환경에서 실행 권장\n" +
+        `에러: ${e.message}`;
+      $loadInfo.textContent = "";
+    }
+  }
+
+  async function primeAudioPermission() {
+    // 모바일(특히 iOS)에서 '사용자 제스처'가 있어야 play 가능 → 시작 버튼 클릭 시 미리 준비
+    try {
+      $alarm.volume = 1.0;
+      await $alarm.play();
+      $alarm.pause();
+      $alarm.currentTime = 0;
+    } catch (_) {}
+  }
+
+  async function start() {
+    triggered = false;
+
+    if (!navigator.geolocation) {
+      alert("이 브라우저는 위치 기능을 지원하지 않습니다.");
+      return;
+    }
+
+    await primeAudioPermission();
+    await requestWakeLock();
+
+    const target = JSON.parse($select.value);
+    const tLat = target.lat;
+    const tLon = target.lon;
+    const tName = target.name;
+
+    $status.textContent = `추적 시작\n목적지: ${tName}\n범위: ${RANGE_M}m`;
+    $start.disabled = true;
+    $stop.disabled = false;
+    $mute.disabled = true;
+    $select.disabled = true;
+
+    watchId = navigator.geolocation.watchPosition(
+      async (pos) => {
+        const lat = pos.coords.latitude;
+        const lon = pos.coords.longitude;
+        const acc = pos.coords.accuracy;
+        const d = haversineMeters(lat, lon, tLat, tLon);
+
+        $status.textContent =
+          `목적지: ${tName}\n` +
+          `현재 정확도: 약 ${Math.round(acc)}m\n` +
+          `거리: 약 ${Math.round(d)}m / ${RANGE_M}m\n` +
+          `시간: ${new Date().toLocaleTimeString()}`;
+
+        // 정확도가 너무 나쁠 때(예: 지하) 오탐 줄이고 싶으면 아래 조건을 켜세요:
+        // if (acc > 80) return;
+
+        if (!triggered && d <= RANGE_M) {
+          triggered = true;
+
+          try { navigator.vibrate?.([300, 200, 300, 200, 600]); } catch (_) {}
+          try { await $alarm.play(); } catch (_) {}
+
+          $mute.disabled = false;
+
+          alert(`🚨 ${tName} 도착! (반경 ${RANGE_M}m 이내)`);
+        }
+      },
+      (err) => {
+        alert("위치 권한을 허용해 주세요. (브라우저 설정에서 위치 ON)");
+        stop();
+      },
+      { enableHighAccuracy: true, maximumAge: 0, timeout: 15000 }
+    );
+  }
+
+  function stop() {
+    if (watchId !== null) {
+      navigator.geolocation.clearWatch(watchId);
+      watchId = null;
+    }
+    triggered = false;
+
+    $alarm.pause();
+    $alarm.currentTime = 0;
+
+    releaseWakeLock();
+
+    $status.textContent = "중지됨";
+    $start.disabled = false;
+    $stop.disabled = true;
+    $mute.disabled = true;
+    $select.disabled = false;
+  }
+
+  function muteOnly() {
+    $alarm.pause();
+    $alarm.currentTime = 0;
+    $mute.disabled = true;
+    // 추적은 계속 유지, 재알림은 막아둠(triggered=true 유지)
+  }
+
+  document.getElementById("startBtn").addEventListener("click", start);
+  document.getElementById("stopBtn").addEventListener("click", stop);
+  document.getElementById("muteBtn").addEventListener("click", muteOnly);
+
+  loadStations();
+</script>
+</body>
+</html>
